@@ -64,7 +64,6 @@
 #include <time.h>
 #include <signal.h>
 #include <errno.h>
-#include <pthread.h>
 #include <limits.h>
 #include <libgen.h>
 #include <pwd.h>
@@ -1085,6 +1084,19 @@ init(int argc, char **argv)
 	return 0;
 }
 
+#ifdef HAVE_WATCH
+void
+start_monitor()
+{
+
+	if (!GETFLAG(INOTIFY_MASK))
+		return;
+
+	av_register_all();
+	monitor_start();
+}
+#endif
+
 /* === main === */
 /* process HTTP or SSDP requests */
 int
@@ -1100,7 +1112,6 @@ main(int argc, char **argv)
 	u_long timeout;	/* in milliseconds */
 	int last_changecnt = 0;
 	pid_t scanner_pid = 0;
-	pthread_t inotify_thread = 0;
 	struct event ssdpev, httpev, monev;
 #ifdef TIVO_SUPPORT
 	uint8_t beacon_interval = 5;
@@ -1135,23 +1146,11 @@ main(int argc, char **argv)
 	}
 	check_db(db, ret, &scanner_pid);
 	lastdbtime = _get_dbtime();
-#ifdef HAVE_INOTIFY
-	if( GETFLAG(INOTIFY_MASK) )
-	{
-		if (!sqlite3_threadsafe() || sqlite3_libversion_number() < 3005001)
-			DPRINTF(E_ERROR, L_GENERAL, "SQLite library is not threadsafe!  "
-			                            "Inotify will be disabled.\n");
-		else if (pthread_create(&inotify_thread, NULL, start_inotify, NULL) != 0)
-			DPRINTF(E_FATAL, L_GENERAL, "ERROR: pthread_create() failed for start_inotify. EXITING\n");
-	}
-#endif /* HAVE_INOTIFY */
 
-#ifdef HAVE_KQUEUE
-	if (!GETFLAG(SCANNING_MASK)) {
-		av_register_all();
-		kqueue_monitor_start();
-	}
-#endif /* HAVE_KQUEUE */
+#ifdef HAVE_WATCH
+	if (!GETFLAG(SCANNING_MASK))
+		start_monitor();
+#endif
 
 	smonitor = OpenAndConfMonitorSocket();
 	if (smonitor > 0)
@@ -1269,14 +1268,18 @@ main(int argc, char **argv)
 		}
 #endif
 
-		if (GETFLAG(SCANNING_MASK) && kill(scanner_pid, 0) != 0) {
-			CLEARFLAG(SCANNING_MASK);
-			if (_get_dbtime() != lastdbtime)
-				updateID++;
-#ifdef HAVE_KQUEUE
-			av_register_all();
-			kqueue_monitor_start();
-#endif /* HAVE_KQUEUE */
+		if (GETFLAG(SCANNING_MASK)) {
+			if (kill(scanner_pid, 0) != 0) {
+				DPRINTF(E_INFO, L_GENERAL, "Scanner exited\n");
+				CLEARFLAG(SCANNING_MASK);
+				if (_get_dbtime() != lastdbtime)
+					updateID++;
+#ifdef HAVE_WATCH
+				start_monitor();
+#endif
+			} else
+				/* Keep checking for the scanner every sec. */
+				timeout = 1000;
 		}
 
 		event_module.process(timeout);
@@ -1348,11 +1351,9 @@ shutdown:
 		close(lan_addr[i].snotify);
 	}
 
-	if (inotify_thread)
-	{
-		pthread_kill(inotify_thread, SIGCHLD);
-		pthread_join(inotify_thread, NULL);
-	}
+#ifdef HAVE_WATCH
+	monitor_stop();
+#endif
 
 	/* kill other child processes */
 	process_reap_children();
